@@ -4,5 +4,6 @@ from .account import Account
 from .dataset import Dataset
 from .review import Review
 from .run import Run
+from .sampling import SamplingPlanRecord
 
-__all__ = ['Account', 'Dataset', 'Review', 'Run']
+__all__ = ['Account', 'Dataset', 'Review', 'Run', 'SamplingPlanRecord']

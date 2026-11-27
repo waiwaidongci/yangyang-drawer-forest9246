@@ -61,3 +61,17 @@ PYTHONDONTWRITEBYTECODE=1 \
 PYTHONPATH="$PWD/projects/yangyang-drawer-forest/backend" \
 python3.11 test-artifacts/yangyang-drawer-forest/tests/domain_checks.py
 ```
+
+## 留出批末检漏报的两波抽检
+
+在归档回放之上，分析员可对某次成功分诊运行的留出批发起盲样抽检，估计常规末检（分诊判为常规队列）漏掉多少失败件。领域核心在 `backend/src/domain/sampling.py`（仅标准库，`python -I -m unittest` 可直接验证规则），HTTP 前缀为 `/api/sampling`。
+
+1. **沿用判定与盲样**：抽检总体取自运行结果的「留出批次返测顺序单」，保留每件的分诊动作与得分；抽单、领单视图（`orders[].items`）只给编号、批次、测读时间、得分和分诊动作，不含 `failed`/末检结论。隐藏结论仅存于服务端快照，供分析员 `GET /api/sampling/{id}/reconciliation` 事后对账。
+2. **首拨随机**：每个留出批用同一个 `random.Random(seed)` 按批次号顺序独立 `sample` 固定件数（`first_wave_size`，默认 3），默认种子沿用台账种子 `261125`，结果可复算。
+3. **回执与漏报口径**：`POST /api/sampling/{id}/receipts` 提交盲样返检结论（`audit_failed`，兼容 `failed/verdict/result/missed` 与 `id/item_id` 写法），支持 `idempotency_key`：同键同内容重试返回 `deduplicated:true`，同键异内容或同件异结论拒绝。默认漏报口径 `routine_failure`＝分诊为常规末检且返检失败（即既有 FN 口径，分诊判定因此参与计算）；另在对账中给出 `final_pass_audit_fail`（末检判过、返检失败）。
+4. **齐套闸门与补抽分配**：首拨回执未齐时，`POST /{id}/supplement` 返回 409（正文带 `missing`），`POST /{id}/claims` 传 `wave:2` 同样 409，绝不先发补抽单；末件首拨回执入库时在同一把计划锁内幂等开立补抽。设首拨共抽 `k×批数`，总名额 `total_quota`（或直接给 `extra_quota`/`remaining_quota`），余下名额 `E`。仍有未抽件的批数为 `B`：`E<B` 时整体 `skipped`，停在首拨、不产生任何二波单；否则每个未抽完批保底 1 件，剩余名额按「首拨漏报数降序、批次号升序」逐件优先分给漏报多且仍有未抽容量的批，容量用尽即溢出到下一批。
+5. **只从未抽过的件补抽**：补抽候选严格等于该批未在任何一波抽中的件，按批次顺序继续消耗同一随机流；二波单与首拨零交集，分配理由逐批写入 `batches[].allocation_reason`。
+6. **估计与换口径时机**：记批容量 `N`、首拨 `n1` 件中 `m1` 漏报。首拨阶段用首拨漏报率外推整批 `N·m1/n1`（等价于 `m1+(N−n1)·m1/n1` 估计首拨未抽部分）。补抽 `n2` 件、`m2` 漏报后，用补抽率直接估计首拨未抽的 `N−n1` 件：`m1+(N−n1)·m2/n2`（与 `m1+m2+(N−n1−n2)·m2/n2` 恒等）。只有**全部补抽回执齐套**，`estimates.basis` 才由 `first_wave` 切到 `supplement`；部分补抽回执期间仍显示首拨估计。各批抽选编号、齐套数、分配理由和两版估计都在 `GET /api/sampling/{id}` 的 `batches` 中可核对。
+7. **领单幂等与并发**：`POST /api/sampling/{id}/claims` 必带 `idempotency_key`（兼容 `key/request_id`）；同一键并发/重试永远返回第一次领到的同一张单（`deduplicated:true`），不重复发单、不换单。服务端按计划加进程内互斥锁并从已提交快照重建聚合，「检查首拨齐套→开立补抽→领单」在同一临界区完成，配合幂等键保证回执与领单并发时闸门不被穿透。
+
+演示口径示例（种子 `261125`、首拨每批 3 件、`total_quota=20`）：首拨 12 件恰好包含唯一留出 FN `YC-HG-1104-A-07`，首拨漏报仅 `YC-HG-1104-A` 为 1，首拨外推总漏报为 4 件；余下 8 个名额在 4 批各保底 1 后，4 个优先名额都给 1104 批，分配为 `{YC-HG-1104-A:5, 其余三批:1}`。补抽 8 件不再含漏报，齐套后估计切换并回落到 1 件，与留出全量已知 FN 数一致。若把 `total_quota` 调到 14（余下 2 < 4 个未抽完批），则状态为 `skipped/stopped_first_wave`，不发补抽单且估计始终停在首拨口径。
